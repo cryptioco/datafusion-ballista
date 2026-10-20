@@ -57,11 +57,11 @@ use std::{convert::TryInto, io::Cursor};
 use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
     BufferExec, BufferMode, ChaosExec, CoalescePlan, FinalizedPartitionState, InputOrder,
-    OrderedRangeRepartitionExec, PartitionGroup, PartitionedBoundedWindowAggExec,
-    PerPartitionFilterExec, PrefixMergeExec, RangeFilterExec, RangeShuffleReaderExec,
-    RangeShuffleWriterExec, RuntimeStatsExec, ScalarOp, ShuffleReaderExec,
-    ShuffleWriterExec, SortShuffleWriterExec, UnorderedRangeRepartitionExec,
-    UnresolvedShuffleExec, WindowApply,
+    OrderedRangeRepartitionExec, PartitionGroup, PartitionSelectExec,
+    PartitionedBoundedWindowAggExec, PerPartitionFilterExec, PrefixMergeExec,
+    RangeFilterExec, RangeShuffleReaderExec, RangeShuffleWriterExec, RuntimeStatsExec,
+    ScalarOp, ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
+    UnorderedRangeRepartitionExec, UnresolvedShuffleExec, WindowApply,
 };
 use crate::serde::protobuf::{
     ballista_logical_plan_node::LogicalPlanType,
@@ -1044,6 +1044,19 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     input.clone(),
                 )?))
             }
+            PhysicalPlanType::PartitionSelect(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "PartitionSelectExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let partitions = node.partitions.iter().map(|&p| p as usize).collect();
+                Ok(Arc::new(PartitionSelectExec::try_new(
+                    input.clone(),
+                    partitions,
+                )?))
+            }
         }
     }
 
@@ -1472,6 +1485,19 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             proto.encode(buf).map_err(|e| {
                 DataFusionError::Internal(format!(
                     "failed to encode PartitionedBoundedWindowAggExec: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<PartitionSelectExec>() {
+            let partitions = exec.partitions().iter().map(|&p| p as u32).collect();
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::PartitionSelect(
+                    protobuf::PartitionSelectExecNode { partitions },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode PartitionSelectExec: {e:?}"
                 ))
             })?;
             Ok(())
@@ -2770,6 +2796,39 @@ mod test {
             .downcast_ref::<BufferExec>()
             .expect("Expected BufferExec");
         assert!(matches!(decoded.mode(), BufferMode::Dam));
+    }
+
+    /// `PartitionSelectExec` round-trips its selected partitions, order
+    /// included. The child is decoded from `inputs[0]` by the framework, so
+    /// a child only another codec understands never reaches this one.
+    #[tokio::test]
+    async fn test_partition_select_exec_roundtrip() {
+        use crate::execution_plans::PartitionSelectExec;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(schema).with_partitions(4));
+        let original = PartitionSelectExec::try_new(input.clone(), vec![3, 1]).unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded_plan
+            .downcast_ref::<PartitionSelectExec>()
+            .expect("Expected PartitionSelectExec");
+        assert_eq!(decoded.partitions(), &[3, 1]);
     }
 
     /// The wrapper carries its ORDER BY across the network so the executor's

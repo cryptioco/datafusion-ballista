@@ -929,7 +929,9 @@ pub(crate) fn create_shuffle_writer_with_config(
 mod test {
     use super::{can_stay_inline, holds_a_broadcast};
     use crate::planner::{DefaultDistributedPlanner, DistributedPlanner};
-    use crate::test_utils::{datafusion_test_context, scan_with_file_groups};
+    use crate::test_utils::{
+        custom_leaf, datafusion_test_context, scan_with_file_groups,
+    };
     use ballista_core::assert_plan;
     use ballista_core::error::BallistaError;
     use ballista_core::execution_plans::{SortShuffleWriterExec, UnresolvedShuffleExec};
@@ -993,6 +995,13 @@ mod test {
     #[test]
     fn plain_union_branch_stays_inline() {
         assert!(can_stay_inline(&scan_with_file_groups(4)));
+    }
+
+    /// So does a branch over a leaf the rewriter has no branch for: it is
+    /// restricted by partition index, which can select none of them.
+    #[test]
+    fn custom_leaf_union_branch_stays_inline() {
+        assert!(can_stay_inline(&custom_leaf(4)));
     }
 
     /// A branch already sitting behind a stage boundary needs nothing more.
