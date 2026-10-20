@@ -1265,3 +1265,86 @@ pub fn scan_with_file_groups(n: usize) -> Arc<dyn ExecutionPlan> {
     }
     DataSourceExec::from_data_source(builder.build())
 }
+
+/// A leaf the task builder has no restriction branch for, standing in for a
+/// user-defined scan. It has `n` partitions and partition `p` yields a single
+/// row holding `p`, so a test can tell which partitions a restricted plan
+/// actually reads. Same schema as [`scan_with_file_groups`].
+pub fn custom_leaf(n: usize) -> Arc<dyn ExecutionPlan> {
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, PlanProperties, SendableRecordBatchStream,
+    };
+    use std::fmt::Formatter;
+
+    #[derive(Debug)]
+    struct PartitionIndexExec {
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for PartitionIndexExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+            write!(f, "PartitionIndexExec")
+        }
+    }
+
+    impl ExecutionPlan for PartitionIndexExec {
+        fn name(&self) -> &str {
+            "PartitionIndexExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            )
+                -> datafusion::common::Result<TreeNodeRecursion>,
+        ) -> datafusion::common::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion::common::Result<SendableRecordBatchStream> {
+            let schema = self.schema();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![partition as i64]))],
+            )?;
+            Ok(Box::pin(MemoryStream::try_new(vec![batch], schema, None)?))
+        }
+    }
+
+    let schema: SchemaRef =
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    Arc::new(PartitionIndexExec {
+        properties: Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(n),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )),
+    })
+}

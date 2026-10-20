@@ -37,7 +37,9 @@
 //! subtrees never share state and there's no traversal-order dependency.
 
 use ballista_core::execution_plans::plan_algebra::as_partition_sliceable;
-use ballista_core::execution_plans::{RangeShuffleReaderExec, ShuffleReaderExec};
+use ballista_core::execution_plans::{
+    PartitionSelectExec, RangeShuffleReaderExec, ShuffleReaderExec,
+};
 use datafusion::common::internal_err;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{
@@ -236,13 +238,16 @@ fn child_scopes(plan: &Arc<dyn ExecutionPlan>, under_collect: bool) -> Vec<bool>
 /// reshapes count but doesn't preserve partition identity, and isn't
 /// implemented on the self-generating leaves anyway. So we downcast here.
 ///
-/// **When a new leaf type surfaces, add a branch below.** Currently
-/// covered: `ShuffleReaderExec`, `DataSourceExec` (files, in-memory),
-/// `PlaceholderRowExec`, `EmptyExec`. `ValuesExec` and other future
-/// self-generating leaves will silently fall through as `None`; if one
-/// sits under a partition-splitting fan-in, the walker leaves it at its
-/// full partition count and the executor duplicates output (see the
-/// PlaceholderRow-under-UnionExec bug for the failure mode).
+/// **When a new leaf type surfaces, consider adding a branch below.**
+/// Currently covered: `ShuffleReaderExec`, `RangeShuffleReaderExec`,
+/// `DataSourceExec` (files, in-memory), `PlaceholderRowExec`, `EmptyExec`.
+/// Any other leaf, user-defined ones included, is wrapped in a
+/// `PartitionSelectExec` that forwards `execute(j)` to `execute(indices[j])`.
+/// That meets the contract for any leaf whose partitions are independent,
+/// but the executor still receives the whole leaf, so a branch that
+/// rebuilds it smaller remains preferable when one is possible. Left
+/// unwrapped, such a leaf keeps its full partition count and every task of
+/// the stage produces all of its output.
 ///
 /// # Scope
 ///
@@ -361,12 +366,13 @@ fn select_output_partitions(
             };
             return Ok(Some(DataSourceExec::from_data_source(restricted)));
         }
+        // Any other source gets the generic leaf selection below, which is
+        // only right if each partition reads its own share of the data.
         warn!(
             "select_output_partitions: unrecognised DataSourceExec source \
-             left unrestricted; if it distributes work from a shared queue, \
-             tasks would over-read"
+             restricted by partition index; if it distributes work from a \
+             shared queue, tasks would over-read"
         );
-        return Ok(None);
     }
 
     // Self-generating leaves: PlaceholderRow (1 all-null row per partition)
@@ -395,6 +401,33 @@ fn select_output_partitions(
             return Ok(Some(DataSourceExec::from_data_source(stub)));
         }
         return Ok(None);
+    }
+
+    // PartitionSelectExec: already a selection, so compose the two rather
+    // than restrict its input like any other single-child operator would,
+    // which would apply `indices` to the wrong partition space.
+    if let Some(select) = plan.downcast_ref::<PartitionSelectExec>() {
+        let kept: Vec<usize> = indices
+            .iter()
+            .filter_map(|&j| select.partitions().get(j).copied())
+            .collect();
+        let restricted = PartitionSelectExec::try_new(select.input().clone(), kept)?;
+        return Ok(Some(Arc::new(restricted)));
+    }
+
+    // Any other leaf: there is no way to rebuild it with fewer partitions,
+    // but `execute(i)` is all the contract above needs, so select them by
+    // index. Out-of-range indices are dropped, as in the branches above.
+    if plan.children().is_empty() {
+        let count = plan.properties().output_partitioning().partition_count();
+        let kept: Vec<usize> = indices.iter().copied().filter(|&i| i < count).collect();
+        if kept.iter().copied().eq(0..count) {
+            return Ok(Some(plan.clone()));
+        }
+        return Ok(Some(Arc::new(PartitionSelectExec::try_new(
+            plan.clone(),
+            kept,
+        )?)));
     }
 
     Ok(None)
@@ -750,5 +783,81 @@ mod tests {
         assert_eq!(reader.partition.len(), 2);
         assert_eq!(reader.partition[0][0].partition_id.partition_id, 1);
         assert_eq!(reader.partition[1][0].partition_id.partition_id, 3);
+    }
+
+    // --- Leaves without a restriction branch ---
+    //
+    // A leaf the walker can't rebuild (a user-defined scan, typically) is
+    // wrapped in a `PartitionSelectExec`. Left whole, the executor would run
+    // every one of its partitions in every task of the stage, multiplying
+    // its output by the stage's task count.
+
+    use crate::test_utils::custom_leaf;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::prelude::SessionContext;
+
+    /// The values each partition of `plan` yields. `custom_leaf` partition
+    /// `p` yields `[p]`, so this names the upstream partitions a restricted
+    /// plan reads, position by position.
+    async fn partition_values(plan: &Arc<dyn ExecutionPlan>) -> Vec<Vec<i64>> {
+        let ctx = SessionContext::new().task_ctx();
+        let mut values = vec![];
+        for partition in 0..plan.properties().output_partitioning().partition_count() {
+            let stream = plan.execute(partition, ctx.clone()).unwrap();
+            let batches = datafusion::physical_plan::common::collect(stream)
+                .await
+                .unwrap();
+            values.push(
+                batches
+                    .iter()
+                    .flat_map(|b| {
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect(),
+            );
+        }
+        values
+    }
+
+    #[tokio::test]
+    async fn custom_leaf_reads_only_the_wanted_partitions() {
+        let restricted = restrict_plan_to_partitions(custom_leaf(4), &[1, 3]).unwrap();
+        assert!(restricted.is::<PartitionSelectExec>());
+        assert_eq!(partition_values(&restricted).await, vec![vec![1], vec![3]]);
+    }
+
+    /// Restricting to every partition in order is the identity, so the leaf
+    /// is shipped as is rather than behind a no-op wrapper.
+    #[test]
+    fn custom_leaf_restricted_to_every_partition_is_left_alone() {
+        let plan = custom_leaf(3);
+        let restricted = restrict_plan_to_partitions(plan.clone(), &[0, 1, 2]).unwrap();
+        assert!(Arc::ptr_eq(&plan, &restricted));
+    }
+
+    /// The union routing relies on an unpolled branch becoming 0-partition,
+    /// which an unrecognised leaf used to never do.
+    #[tokio::test]
+    async fn custom_leaf_under_union_reads_only_its_own_partition() {
+        let union: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![custom_leaf(3), custom_leaf(3)]).unwrap();
+        let restricted = restrict_plan_to_partitions(union, &[4]).unwrap();
+        let children = restricted.children();
+        assert!(partition_values(children[0]).await.is_empty());
+        assert_eq!(partition_values(children[1]).await, vec![vec![1]]);
+    }
+
+    /// Restricting an already restricted plan composes the two selections
+    /// instead of applying the second to the leaf's own partitions.
+    #[tokio::test]
+    async fn restricting_a_selection_composes_with_it() {
+        let once = restrict_plan_to_partitions(custom_leaf(6), &[1, 3, 5]).unwrap();
+        let twice = restrict_plan_to_partitions(once, &[2, 0]).unwrap();
+        assert_eq!(partition_values(&twice).await, vec![vec![5], vec![1]]);
     }
 }
