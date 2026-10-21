@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -71,6 +71,8 @@ pub mod ballista_physical_plan_node {
         PrefixMerge(super::PrefixMergeExecNode),
         #[prost(message, tag = "15")]
         RangeShuffleWriter(super::RangeShuffleWriterExecNode),
+        #[prost(message, tag = "16")]
+        PartitionSelect(super::PartitionSelectExecNode),
     }
 }
 /// Value-range router over N locally-sorted overlapping input partitions.
@@ -194,6 +196,14 @@ pub struct PerPartitionFilterExecNode {
     pub predicates: ::prost::alloc::vec::Vec<
         ::datafusion_proto::protobuf::PhysicalExprNode,
     >,
+}
+/// Expose a subset of the input's partitions: output partition `j` is input
+/// partition `partitions\[j\]`. The child plan is plumbed by the framework as
+/// `inputs\[0\]` during decode, so it is encoded by whichever codec handles it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionSelectExecNode {
+    #[prost(uint32, repeated, tag = "1")]
+    pub partitions: ::prost::alloc::vec::Vec<u32>,
 }
 /// Filter inputs with a per-input-partition half-open range predicate
 /// widened by `halo_lo` / `halo_hi`. `raw_bounds\[k\]` is the cut range for
