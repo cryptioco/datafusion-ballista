@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cluster::{ExecutorSlot, JobState, JobStateEventStream};
+use crate::cluster::{BoundTask, ExecutorSlot, JobState, JobStateEventStream};
 use crate::config::SchedulerConfig;
 use crate::physical_optimizer::file_group_balance::BalanceAndPruneFileGroups;
 use crate::planner::DefaultDistributedPlanner;
@@ -25,6 +25,7 @@ use crate::state::distributed_explain::handle_explain_plan;
 use crate::state::execution_graph::{
     ExecutionGraphBox, RunningTaskInfo, StaticExecutionGraph, TaskDescription,
 };
+use crate::state::execution_stage::ExecutionStage;
 use crate::state::executor_manager::ExecutorManager;
 use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::error::BallistaError;
@@ -34,8 +35,9 @@ use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     JobStatus, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus, job_status,
+    task_status,
 };
-use ballista_core::serde::scheduler::ExecutorMetadata;
+use ballista_core::serde::scheduler::{ExecutorMetadata, TaskKey};
 use ballista_core::{JobId, JobStatusSubscriber};
 use dashmap::DashMap;
 use datafusion::execution::config::SessionConfig;
@@ -135,6 +137,11 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     scheduler_id: String,
     /// Cache for active jobs curated by this scheduler.
     active_job_cache: ActiveJobCache,
+    /// Push-scheduled reservations outlive stage retirement and job eviction.
+    /// Only outstanding tasks are retained, without their plans or graphs.
+    /// Entries are consumed by terminal reports, launch rejection or job
+    /// cancellation, and discarded when the owning executor is lost.
+    outstanding_task_reservations: Arc<DashMap<(String, TaskKey, usize), u32>>,
     /// Task launcher implementation.
     launcher: Arc<dyn TaskLauncher>,
     /// Maximum number of failure attempts for task-level retry before the task is considered failed
@@ -197,6 +204,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             codec,
             scheduler_id: scheduler_id.clone(),
             active_job_cache: Arc::new(DashMap::new()),
+            outstanding_task_reservations: Arc::new(DashMap::new()),
             launcher: Arc::new(DefaultTaskLauncher::new(scheduler_endpoint)),
             task_max_failures: config.task_max_failures,
             stage_max_failures: config.stage_max_failures,
@@ -216,6 +224,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             codec,
             scheduler_id,
             active_job_cache: Arc::new(DashMap::new()),
+            outstanding_task_reservations: Arc::new(DashMap::new()),
             launcher,
             task_max_failures: config.task_max_failures,
             stage_max_failures: config.stage_max_failures,
@@ -513,37 +522,74 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         Ok(graph.session_config())
     }
 
-    /// Sum the vcores consumed by the given task statuses at their original
-    /// bind time. Used to refund the executor's vcore budget when tasks
-    /// complete: refunding `statuses.len()` (one per task) would drop
-    /// leftover vcores forever, because `bind_one` consumes `slice.len()`
-    /// vcores per task under the multi-partition-task model.
-    ///
-    /// Statuses whose (job, stage, task_id) can no longer be resolved
-    /// (e.g. the job's graph has been evicted) contribute 0.
-    pub(crate) async fn sum_vcores_for_statuses(&self, statuses: &[TaskStatus]) -> u32 {
-        let mut statuses_by_job: HashMap<String, Vec<&TaskStatus>> = HashMap::new();
-        for status in statuses {
-            statuses_by_job
-                .entry(status.job_id.clone())
-                .or_default()
-                .push(status);
+    /// Record the exact bind-time budget before dispatching any push tasks.
+    /// Stage attempts are part of the identity because a rollback can reuse
+    /// task ids. The executor is part of the identity so a stale report cannot
+    /// release another executor's reservation.
+    pub(crate) fn record_task_reservations(&self, tasks: &[BoundTask]) {
+        for (executor_id, task) in tasks {
+            self.outstanding_task_reservations
+                .entry((
+                    executor_id.clone(),
+                    task.key.clone(),
+                    task.stage_attempt_num,
+                ))
+                .or_insert(task.vcores_consumed);
         }
-        let mut total_vcores: u32 = 0;
-        for (job_id, job_statuses) in statuses_by_job {
-            let Some(graph_arc) = self.get_active_execution_graph(&job_id.into()) else {
-                continue;
-            };
-            let graph = graph_arc.read().await;
-            for status in job_statuses {
-                if let Some(vcores) =
-                    graph.task_vcores(status.stage_id as usize, status.task_id as usize)
-                {
-                    total_vcores += vcores;
-                }
-            }
-        }
-        total_vcores
+    }
+
+    /// Consume reservations for terminal task reports exactly once, including
+    /// reports received after the entire job graph has been evicted.
+    pub(crate) fn take_vcores_for_statuses(
+        &self,
+        executor_id: &str,
+        statuses: &[TaskStatus],
+    ) -> u32 {
+        statuses
+            .iter()
+            .filter(|status| {
+                matches!(
+                    status.status,
+                    Some(
+                        task_status::Status::Successful(_)
+                            | task_status::Status::Failed(_)
+                    )
+                )
+            })
+            .filter_map(|status| {
+                self.outstanding_task_reservations.remove(&(
+                    executor_id.to_owned(),
+                    TaskKey {
+                        job_id: status.job_id.clone().into(),
+                        stage_id: status.stage_id as usize,
+                        task_id: status.task_id as usize,
+                    },
+                    status.stage_attempt_num as usize,
+                ))
+            })
+            .map(|(_, vcores)| vcores)
+            .sum()
+    }
+
+    /// Release a batch that could not be launched. Using the same ledger as
+    /// terminal reports prevents rejection/cancellation races from refunding
+    /// a reservation twice, and refunds multi-vcore tasks at their full weight.
+    pub(crate) fn take_task_reservations(
+        &self,
+        executor_id: &str,
+        tasks: &[TaskDescription],
+    ) -> u32 {
+        tasks
+            .iter()
+            .filter_map(|task| {
+                self.outstanding_task_reservations.remove(&(
+                    executor_id.to_owned(),
+                    task.key.clone(),
+                    task.stage_attempt_num,
+                ))
+            })
+            .map(|(_, vcores)| vcores)
+            .sum()
     }
 
     /// Update given task statuses in the respective job and return a tuple containing:
@@ -673,14 +719,24 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             (running_tasks, pending_tasks, snapshot)
         };
 
-        // The vcores those tasks hold on their executors. Their terminal
-        // status arrives after the job has left the active cache, so the
-        // `TaskUpdating` refund never sees them (#2418). They are refunded
-        // as soon as the cancel is sent, so an executor can be briefly
-        // oversubscribed while the cancelled tasks wind down.
+        // Preserve the existing eager cancellation refund, but consume the
+        // same reservations as terminal reports. A late completion must not
+        // refund them again. Retired tasks are not in `running_tasks` and keep
+        // their reservations until they finish or their executor is lost.
         let mut freed: HashMap<String, u32> = HashMap::new();
         for task in &running_tasks {
-            if let Some(vcores) = snapshot.task_vcores(task.stage_id, task.task_id) {
+            if let Some(ExecutionStage::Failed(stage)) =
+                snapshot.stages().get(&task.stage_id)
+                && let Some((_, vcores)) = self.outstanding_task_reservations.remove(&(
+                    task.executor_id.clone(),
+                    TaskKey {
+                        job_id: task.job_id.clone(),
+                        stage_id: task.stage_id,
+                        task_id: task.task_id,
+                    },
+                    stage.stage_attempt_num,
+                ))
+            {
                 *freed.entry(task.executor_id.clone()).or_default() += vcores;
             }
         }
@@ -748,6 +804,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     ///
     /// Returns a list of running tasks that need to be cancelled.
     pub async fn executor_lost(&self, executor_id: &str) -> Result<Vec<RunningTaskInfo>> {
+        // Its capacity has been removed, so there is nothing left to refund.
+        // Do this even for evicted jobs and before a graph reset can fail.
+        self.outstanding_task_reservations
+            .retain(|(executor, _, _), _| executor != executor_id);
         // Collect all the running task need to cancel when there are running stages rolled back.
         let mut running_tasks_to_cancel: Vec<RunningTaskInfo> = vec![];
 
@@ -1393,11 +1453,12 @@ mod tests {
     async fn aborted_tasks_are_cancelled_before_terminal_persistence() -> Result<()> {
         let (manager, state, job_id, active_graph) = setup_job(false).await?;
         let executor = mock_executor("executor-1".to_string());
-        active_graph
+        let task = active_graph
             .write()
             .await
             .pop_next_task(&executor.id)?
             .expect("job should have a task to assign");
+        manager.record_task_reservations(&[(executor.id.clone(), task)]);
 
         let cancelled_tasks = Arc::new(AtomicUsize::new(0));
         let cancelled_tasks_for_abort = cancelled_tasks.clone();
@@ -1498,3 +1559,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod reservations_tests;
